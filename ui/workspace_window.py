@@ -347,8 +347,17 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
             _char_w = max(34, (w0 - _gap * (_n - 1)) // _n)
             for _, b in self._char_buttons:
                 b.setFixedWidth(_char_w)
+        # 分组前缀 6 钮（A/B/C/D/E/F）：与字数筛选 6 钮同处理，等宽铺满
+        if hasattr(self, "_prefix_buttons") and self._prefix_buttons:
+            _n = len(self._prefix_buttons)
+            _gap = 2
+            _char_w = max(34, (w0 - _gap * (_n - 1)) // _n)
+            for _, b in self._prefix_buttons:
+                b.setFixedWidth(_char_w)
         if hasattr(self, "_char_filter_widget"):
             self._char_filter_widget.setFixedWidth(w0)   # 字数筛选行与功能按钮同宽 → 无贴左、多贴右对齐
+        if hasattr(self, "_prefix_filter_widget"):
+            self._prefix_filter_widget.setFixedWidth(w0)   # 分组前缀行与功能按钮同宽 → A贴左、F贴右对齐
 
     def _reorder_top_prefix(self):
         """把 配置/部署/保存 三个按钮移到五框（inputLayout）之前（用户要求）。
@@ -400,8 +409,12 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.btnSaveSingle.setToolTip("把启用=A 的行按分组首字母拆分导出：E 开头→English.dict.yaml，其它→wubi.dict.yaml（弹框选保存位置）")
         # 功能4：批量删除（按词表文件）
         self.btnBatchDelete.setToolTip("批量删除：选择『一行一词组』的文本文件，凡 TSV 第1列(词组)完全匹配的词条整行删除（确认后直接落盘）")
-        # 功能5：导出分组
-        self.btnExportGroup.setToolTip("先点选左侧分组栏标签，再点此钮 → 把该分组下右侧表格当前显示的整表内容导出为 TSV（弹框输入名称保存）")
+        # 功能5：导出分组（导出当前右侧表格显示的内容，含分组/前缀/字数等筛选后的结果）
+        self.btnExportGroup.setToolTip("导出当前右侧表格显示的内容（含分组/前缀/字数等筛选后的结果）为 TSV（弹框输入名称保存）")
+        # 功能6：分组前缀筛选排序（A/B/C/D/E/F）
+        if hasattr(self, "_prefix_buttons"):
+            for letter, b in self._prefix_buttons:
+                b.setToolTip("筛选分组以「%s 」开头的行 → 按(启用↑,编码↑,权重↓)排序（不导出，仅改视图）" % letter)
 
     def _build_feature_buttons(self):
         """右侧功能栏：程序化新增功能模块按钮。
@@ -441,6 +454,7 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self._char_filter_widget = QWidget()
         self._char_filter_widget.setLayout(hbox)
         self._char_active = -1          # 当前激活的字数筛选值（-1=无）
+        self._prefix_active = ""        # 当前激活的分组前缀（""=无；非空=字母A~F）
 
         # 功能2：一词多码（第5行，可勾选）
         self.btnMultiCode = QPushButton("🔢 一词多码")
@@ -457,6 +471,23 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
 
         # 功能5：导出分组（先点选左侧分组栏标签，再点此钮 → 导出该分组下右侧表格内容）
         self.btnExportGroup = QPushButton("📤 导出分组")
+
+        # 功能6：分组前缀筛选排序（A/B/C/D/E/F 横排 6 钮）
+        # 点按钮A → 筛出分组以"A "开头的行 → 按(启用asc,编码asc,权重desc)排序（不导出，仅改视图）
+        self._prefix_buttons = []
+        hbox_prefix = QHBoxLayout()
+        hbox_prefix.setSpacing(2)
+        hbox_prefix.setContentsMargins(0, 0, 0, 0)
+        for idx, letter in enumerate(["A", "B", "C", "D", "E", "F"]):
+            b = QPushButton(letter)
+            _apply_btn_class(b, "btn-ghost")
+            b.clicked.connect(lambda _=None, l=letter: self.on_prefix_filter(l))
+            self._prefix_buttons.append((letter, b))
+            hbox_prefix.addWidget(b)
+            if idx != 5:
+                hbox_prefix.addStretch(1)
+        self._prefix_filter_widget = QWidget()
+        self._prefix_filter_widget.setLayout(hbox_prefix)
 
         # 全量功能按钮列表（供 _apply_btn_classes / _apply_right_panel_style 统一处理等宽样式）。
         # 注：字数筛选的 6 个单字按钮走独立布局，不加入此列表（避免被强制拉宽）。
@@ -477,6 +508,7 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.rightLayout.addWidget(self.btnIncomplete)
         self.rightLayout.addWidget(self.btnBatchDelete)
         self.rightLayout.addWidget(self.btnExportGroup)
+        self.rightLayout.addWidget(self._prefix_filter_widget)
 
         # 重复词条处理（P0-2：重复定义=词组+编码 完全相同）：高亮开关 + 跳转下一处 + 合并
         self.btnDupHighlight = QPushButton("🔍 重复项筛选")
@@ -668,10 +700,19 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.btnMultiCode.setText("🔢 一词多码")
 
     def _reset_filter_buttons(self):
-        """复位全部筛选型按钮（五要素不全 / 字数 / 一词多码）到关闭态。"""
+        """复位全部筛选型按钮（五要素不全 / 字数 / 一词多码 / 分组前缀）到关闭态。"""
         self._reset_incomplete_button()
         self._reset_char_filter()
         self._reset_multi_code_button()
+        self._reset_prefix_filter()
+
+    def _reset_prefix_filter(self):
+        """复位分组前缀筛选按钮组到全关态（与模型 clear_filter 对齐）。"""
+        if not hasattr(self, "_prefix_buttons"):
+            return
+        self._prefix_active = ""
+        for _, b in self._prefix_buttons:
+            _apply_btn_class(b, "btn-ghost")
 
     def on_char_count_clicked(self, n):
         """字数筛选（功能1）：点单字按钮 → 仅显示词组列字符数匹配的行；再点同一钮取消。
@@ -694,6 +735,28 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
                 new, "及以上" if new == 5 else ""), "ok")
         for val, b in self._char_buttons:
             _apply_btn_class(b, "btn-main" if val == self._char_active else "btn-ghost")
+        self._update_status()
+
+    def on_prefix_filter(self, letter):
+        """分组前缀筛选排序（功能6）：点按钮A → 筛出分组列以"A "开头的行 →
+        按(启用asc,编码asc,权重desc)排序。点同一按钮取消筛选。
+        此按钮仅改视图（筛选+排序），不触发导出；导出由「📤 导出分组」统一执行。"""
+        if self._model is None or self._current_kind != "tsv":
+            info(self, "分组前缀筛选", "请先加载 TSV 词库。")
+            return
+        # 切换：同一按钮 → 取消；不同按钮 → 新筛选
+        new_prefix = "" if self._prefix_active == letter else letter
+        self._prefix_active = new_prefix
+        if new_prefix:
+            self._flash_status("正在筛选分组前缀「%s 」并排序…" % new_prefix, "ok")
+        else:
+            self._flash_status("已清除分组前缀筛选", "ok")
+        # 设置筛选状态（前缀筛选不叠加字数/多码等筛选，先清其它，再应用前缀）
+        self._model.set_filter_state(prefix=new_prefix)
+        # 后台筛选 → 完成后回调 _on_filter_computed 里再触发排序
+        self._run_background_filter()
+        for val, b in self._prefix_buttons:
+            _apply_btn_class(b, "btn-main" if val == self._prefix_active else "btn-ghost")
         self._update_status()
 
     def on_multi_code_toggled(self, checked):
@@ -1818,6 +1881,12 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         if self._model is None:
             return
         self._model.commit_order(order)
+        # 前缀筛选时自动按(启用asc,编码asc,权重desc)排序（功能6：A-F 按钮）
+        if self._prefix_active and hasattr(self._model, "sort_by_keys"):
+            enable_col = self._model.FIELD_COLS["启用"]
+            code_col = self._model.FIELD_COLS["编码"]
+            weight_col = self._model.FIELD_COLS["权重"]
+            self._model.sort_by_keys([(enable_col, False), (code_col, False), (weight_col, True)])
         self._update_status()
         if autofill:
             self._autofill_unique()   # 仅顶部五框筛选（autofill=True）时回填唯一结果；选分组时跳过
@@ -2167,20 +2236,16 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self._refresh_action_buttons()
 
     def on_export_group(self):
-        """导出分组（功能5）：先点选左侧分组栏标签 → 再点此钮 →
-        把该分组下右侧表格当前显示的整表内容导出为 TSV。
-
-        取数口径：直接读 _model._order（即右侧表格当前显示行，含分组头过滤后的真实顺序），
-        跳过分组头行，仅导出数据行。用户点选分组标签后右侧表格已只剩该组，故无需再按列二次筛。
+        """导出当前右侧表格显示的内容（功能5）：
+        无论当前是分组筛选、前缀筛选、字数筛选还是其它筛选状态，
+        一律导出右侧表格当前显示的全部数据行（_model._order 的屏幕顺序，跳过分组头）。
         弹原生『保存』窗口（输入名称），写 5 列 tab 制表符 TSV（与源文件同格式）。
+        默认文件名反映当前筛选状态（分组名/前缀字母/字数等）。
         """
         if self._model is None or self._current_kind != "tsv":
-            info(self, "导出分组", "请先加载 TSV 词库。")
+            info(self, "导出", "请先加载 TSV 词库。")
             return
-        # 1) 取左侧当前选中的分组标签（用户刚点选的那个）
-        cur = self.groupListWidget.currentItem()
-        group_name = "" if cur is None or cur.text() == "（全部）" else cur.text()
-        # 2) 取右侧表格当前显示的全部数据行（保留屏幕顺序）
+        # 1) 取右侧表格当前显示的全部数据行（保留屏幕顺序，跳过分组头）
         order = self._model._order
         data = self._model._all_data
         rows = []
@@ -2188,31 +2253,41 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
             if isinstance(e, int) and 0 <= e < len(data):
                 rows.append(data[e])
         if not rows:
-            info(self, "导出分组",
-                 "当前右侧表格没有可导出的内容（该分组下无词条，或未加载数据）。")
+            info(self, "导出", "当前右侧表格没有可导出的内容。")
             return
-        # 3) 弹原生保存窗口（输入名称），默认文件名带分组名
-        default_name = ("%s.tsv" % group_name) if group_name else "全部分组.tsv"
+        # 2) 根据当前筛选状态生成默认文件名
+        default_name = self._make_export_default_name()
         out_path, _ = QFileDialog.getSaveFileName(
-            self, "导出分组「%s」" % (group_name or "全部"),
+            self, "导出当前表格内容",
             default_name, "TSV 文件 (*.tsv);;所有文件 (*.*)")
         if not out_path:
-            self.statusBar().showMessage("已取消导出分组", 2000)
+            self.statusBar().showMessage("已取消导出", 2000)
             return
         if not out_path.lower().endswith(".tsv"):
             out_path += ".tsv"
-        # 4) 写 5 列 tab 制表符 TSV（与源 Alamo.tsv 同格式）
+        # 3) 写 5 列 tab 制表符 TSV（与源 Alamo.tsv 同格式）
         try:
             with open(out_path, "w", encoding="utf-8", newline="") as fh:
                 for r in rows:
                     fh.write("\t".join((c or "").strip() for c in r) + "\n")
         except OSError as exc:
-            critical(self, "导出分组", "写出失败：\n%s" % exc)
+            critical(self, "导出", "写出失败：\n%s" % exc)
             return
-        info(self, "导出分组",
-             "已导出分组「%s」：%d 行\n→ %s" % (group_name or "全部", len(rows), out_path))
-        self.statusBar().showMessage(
-            "已导出分组 %s（%d 行）→ %s" % (group_name or "全部", len(rows), out_path), 4000)
+        info(self, "导出", "已导出 %d 行\n→ %s" % (len(rows), out_path))
+        self.statusBar().showMessage("已导出 %d 行 → %s" % (len(rows), out_path), 4000)
+
+    def _make_export_default_name(self):
+        """根据当前筛选状态生成导出默认文件名。"""
+        # 优先级：分组前缀 > 分组标签 > 字数 > 全部分组
+        if self._prefix_active:
+            return "前缀_%s.tsv" % self._prefix_active
+        if hasattr(self, "_char_active") and self._char_active and self._char_active >= 0:
+            return "字数_%s.tsv" % self._char_active
+        if hasattr(self, "groupListWidget"):
+            cur = self.groupListWidget.currentItem()
+            if cur is not None and cur.text() != "（全部）":
+                return "%s.tsv" % cur.text()
+        return "全部分组.tsv"
 
     def on_deploy(self):
         """保存并触发 Rime 部署。本期部署钩子默认等价于保存；外部部署命令可在此扩展。"""

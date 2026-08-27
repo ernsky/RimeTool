@@ -50,6 +50,8 @@ class DictModel(QAbstractTableModel):
         self._multi_code_srcs = set()
         # 重复项筛选：开启时仅保留 (词组,编码) 完全相同的重复行，并按 (词组,编码) 聚拢相邻
         self._dup_only_filter = False
+        # 分组前缀筛选（功能6：A-F 按钮）：空=关闭；非空=仅保留分组列以该字母开头的行
+        self._prefix_filter = ""
         # 分组视图：在「全部」视图下于数据行前插入 ("H",组名) 分组头行（tsv 默认开启）
         self._grouped = True
         # 分组头行视觉样式（主题无关：玫红加粗文字，区别于数据行）
@@ -554,7 +556,7 @@ class DictModel(QAbstractTableModel):
         self._rebuild_order()
 
     def clear_filter(self) -> None:
-        """清除全部筛选（文本 / 五框字段 / 分组 / 五要素不全 / 重复项），恢复显示全部行。"""
+        """清除全部筛选（文本 / 五框字段 / 分组 / 五要素不全 / 重复项 / 分组前缀），恢复显示全部行。"""
         self._text_filter = ""
         self._field_filter = {}
         self._group_filter = ""
@@ -562,6 +564,7 @@ class DictModel(QAbstractTableModel):
         self._char_count_filter = -1
         self._multi_code_filter = False
         self._dup_only_filter = False
+        self._prefix_filter = ""
         self._rebuild_order()
 
     def snapshot_filters(self) -> dict:
@@ -575,11 +578,13 @@ class DictModel(QAbstractTableModel):
             "multi_code": self._multi_code_filter,
             "multi_code_srcs": self._multi_code_srcs,
             "dup_only": self._dup_only_filter,
+            "prefix": self._prefix_filter,
             "grouped": self._grouped,
         }
 
     def set_filter_state(self, *, text=None, field=None, group=None, incomplete=None,
-                         char_count=None, multi_code=None, dup_only=None) -> None:
+                         char_count=None, multi_code=None, dup_only=None,
+                         prefix=None) -> None:
         """仅设置筛选状态，不触发重建（重建由调用方显式走后台线程 commit_order）。
 
         用于大词库把筛选计算下沉后台，避免主线程全表扫描卡顿；dict 模式与单测仍走
@@ -610,6 +615,8 @@ class DictModel(QAbstractTableModel):
             if dup_only and not self._dup_computed:
                 self.recompute_duplicates()   # 懒计算：首次启用重复项筛选时才算重复集合
             self._dup_only_filter = bool(dup_only)
+        if prefix is not None:
+            self._prefix_filter = prefix or ""
 
     def commit_order(self, new_order: list, restore_loaded: bool = True) -> None:
         """后台线程预算出新顺序后，由主线程调用以原子刷新显示（含懒加载到切换前的规模）。
@@ -994,9 +1001,36 @@ class DictModel(QAbstractTableModel):
                                [Qt.DisplayRole, Qt.EditRole])
         return True
 
+    def sort_by_keys(self, keys: list) -> None:
+        """多键排序：keys = [(col, reverse), ...]，按优先级依次比较。
+        与 sort() 一致转为平铺视图（无分组头），下次筛选/分组时恢复分组。"""
+        data_idx = [e for e in self._order if isinstance(e, int)]
+        if len(data_idx) < 2:
+            return
+        def key_fn(i):
+            tup = []
+            for col, reverse in keys:
+                v = self._all_data[i][col]
+                if col in NUMERIC_COLS:
+                    try:
+                        val = (0, int(v))
+                    except ValueError:
+                        val = (1, v)
+                else:
+                    val = (0, v.lower() if isinstance(v, str) else v)
+                if reverse:
+                    # 数值取反，字符串/元组用反向标记
+                    val = tuple((-x if isinstance(x, (int, float)) else x for x in val))
+                tup.append(val)
+            return tuple(tup)
+        data_idx.sort(key=key_fn)
+        self.layoutAboutToBeChanged.emit()
+        self._order = data_idx
+        self._loaded = min(self._loaded, len(self._order))
+        self._order_dirty = True
+        self.layoutChanged.emit()
+
     def sort_display_by_weight(self, desc: bool = True) -> None:
-        """把当前筛选结果显示顺序按权重降序（或升序）排列（仅显示顺序，不重排 _all_data）。
-        手动按词频排序后转为平铺视图（无分组头），下次筛选/分组时恢复分组。返回行数。"""
         data_idx = [e for e in self._order if isinstance(e, int)]
         if len(data_idx) < 2:
             return 0
@@ -1341,6 +1375,12 @@ def compute_filtered_order(data: List[Tuple], filters: dict) -> list:
                       if key_count[((data[i][0] or "").strip(), (data[i][1] or "").strip())] > 1]
         data_order.sort(key=lambda i: ((data[i][0] or "").strip(),
                                        (data[i][1] or "").strip()))
+    # 分组前缀筛选（功能6：A-F 按钮）：仅保留分组列以该字母开头的行
+    prefix = (filters.get("prefix") or "").strip()
+    if prefix:
+        grp_col = DictModel.FIELD_COLS["分组"]
+        data_order = [i for i in data_order
+                      if (data[i][grp_col] or "").strip().lower().startswith(prefix.lower())]
     # 分组头：仅「全部」视图（未选特定分组）且启用分组视图、且非一词多码/重复项筛选模式时插入
     # （一词多码/重复项筛选模式强制不插分组头，实现「不区分分组、相同条目跨组相邻」）
     if filters.get("grouped") and not group and not filters.get("multi_code") and not filters.get("dup_only"):
