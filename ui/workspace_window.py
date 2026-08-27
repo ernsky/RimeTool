@@ -179,6 +179,7 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
 
         # 五框联动状态
         self._updating = False       # 程序性填值期间抑制信号回环
+        self._sel_original_word = None   # 选中回填时的原词组快照（选区漂移校验基准）
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
         self._filter_timer.timeout.connect(self._apply_filter_now)
@@ -397,6 +398,10 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.btnMultiCode.setToolTip("开/关『一词多码』筛选：仅显示同一词组存在多个不同编码的行")
         # 功能3：保存为单一码表
         self.btnSaveSingle.setToolTip("把启用=A 的行按分组首字母拆分导出：E 开头→English.dict.yaml，其它→wubi.dict.yaml（弹框选保存位置）")
+        # 功能4：批量删除（按词表文件）
+        self.btnBatchDelete.setToolTip("批量删除：选择『一行一词组』的文本文件，凡 TSV 第1列(词组)完全匹配的词条整行删除（确认后直接落盘）")
+        # 功能5：导出分组
+        self.btnExportGroup.setToolTip("先点选左侧分组栏标签，再点此钮 → 把该分组下右侧表格当前显示的整表内容导出为 TSV（弹框输入名称保存）")
 
     def _build_feature_buttons(self):
         """右侧功能栏：程序化新增功能模块按钮。
@@ -447,12 +452,19 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.btnIncomplete = QPushButton("⚠ 要素不全")
         self.btnIncomplete.setCheckable(True)
 
+        # 功能4：批量删除（按词表文件，词组列完全匹配即删整行）
+        self.btnBatchDelete = QPushButton("🗑️ 批量删除")
+
+        # 功能5：导出分组（先点选左侧分组栏标签，再点此钮 → 导出该分组下右侧表格内容）
+        self.btnExportGroup = QPushButton("📤 导出分组")
+
         # 全量功能按钮列表（供 _apply_btn_classes / _apply_right_panel_style 统一处理等宽样式）。
         # 注：字数筛选的 6 个单字按钮走独立布局，不加入此列表（避免被强制拉宽）。
         self._feature_buttons = [
             self.btnNewEncode,
             self.btnExportRime, self.btnBatchWeight, self.btnVoiceGap,
             self.btnMultiCode, self.btnSaveSingle, self.btnIncomplete,
+            self.btnBatchDelete, self.btnExportGroup,
         ]
         # 按目标垂直顺序加入右侧栏（每项占一行）
         self.rightLayout.addWidget(self.btnNewEncode)
@@ -463,6 +475,8 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.rightLayout.addWidget(self.btnMultiCode)
         self.rightLayout.addWidget(self.btnSaveSingle)
         self.rightLayout.addWidget(self.btnIncomplete)
+        self.rightLayout.addWidget(self.btnBatchDelete)
+        self.rightLayout.addWidget(self.btnExportGroup)
 
         # 重复词条处理（P0-2：重复定义=词组+编码 完全相同）：高亮开关 + 跳转下一处 + 合并
         self.btnDupHighlight = QPushButton("🔍 重复项筛选")
@@ -474,6 +488,8 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
             self.rightLayout.addWidget(b)
 
         _apply_btn_class(self.btnIncomplete, "btn-ghost")
+        _apply_btn_class(self.btnBatchDelete, "btn-red")
+        _apply_btn_class(self.btnExportGroup, "btn-primary")
         _apply_btn_class(self.btnMultiCode, "btn-ghost")
         _apply_btn_class(self.btnSaveSingle, "btn-ghost")
         _apply_btn_class(self.btnDupHighlight, "btn-ghost")
@@ -1051,8 +1067,9 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.btnMultiCode.toggled.connect(self.on_multi_code_toggled)
         # 功能3：保存为单一码表
         self.btnSaveSingle.clicked.connect(self.on_save_single_code_table)
+        self.btnBatchDelete.clicked.connect(self.on_batch_delete)
+        self.btnExportGroup.clicked.connect(self.on_export_group)
         self.fileTree.itemClicked.connect(self._on_tree_clicked)
-        # Bug B 修复：分组列表点击加 150ms 去抖，避免疯狂连点产生大量后台筛选线程
         self._group_click_timer = QTimer(self)
         self._group_click_timer.setSingleShot(True)
         self._group_click_timer.timeout.connect(self._on_group_clicked_deferred)
@@ -1064,6 +1081,12 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self.editWeight.textEdited.connect(self._on_text_edited)
         self.comboGroup.currentTextChanged.connect(self._on_combo_changed)
         self.comboEnable.currentTextChanged.connect(self._on_combo_changed)
+        # 需求5：无选中行时，点/聚焦五框任意框 → 取消分组筛选回到「全部」
+        self.editWord.cursorPositionChanged.connect(self._on_any_box_focused)
+        self.editCode.cursorPositionChanged.connect(self._on_any_box_focused)
+        self.editWeight.cursorPositionChanged.connect(self._on_any_box_focused)
+        self.comboGroup.activated.connect(self._on_any_box_focused)
+        self.comboEnable.activated.connect(self._on_any_box_focused)
         # 窗口 / 左右分隔条缩放时，重新按比例铺满列宽（保持无横向滚动条）
         self.splitter.splitterMoved.connect(self._fit_columns_to_view)
         self.midSplitter.splitterMoved.connect(self._fit_columns_to_view)
@@ -1313,6 +1336,9 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
             return
         name = "" if item.text() == "（全部）" else item.text()
         self._clear_fields()   # 选分组列 → 清空五框
+        gw = getattr(self, "groupListWidget", None)
+        if gw is not None:
+            gw.setCurrentItem(item)   # 显式高亮当前分组（不依赖 itemClicked 自动设 currentRow 的副作用）
         if self._current_kind == "tsv":
             # Bug A 修复：点分组同时清空字段筛选（field={}），避免旧列筛选残留叠加
             self._model.set_filter_state(group=name, field={})
@@ -1519,15 +1545,19 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self._refresh_action_buttons()     # 选中数变化即重算「移动到」按钮
         self._update_status()              # 状态栏「选 N」实时更新
         if not rows or self._model is None:
+            self._sel_original_word = None
             return
         # 多选（≥2 行）→ 清空五框（不绑单行，避免误填）
         if len(rows) >= 2:
             self._clear_fields()
+            self._sel_original_word = None
             return
         view_row = rows[0]
         self._updating = True
         try:
-            self.editWord.setText(self._model.get_field(view_row, "词组"))
+            orig_word = self._model.get_field(view_row, "词组")
+            self._sel_original_word = orig_word   # 选区漂移校验基准：回填时的原词组快照
+            self.editWord.setText(orig_word)
             self.editCode.setText(self._model.get_field(view_row, "编码"))
             self.editWeight.setText(self._model.get_field(view_row, "权重"))
             if self._current_kind == "tsv":
@@ -1565,43 +1595,50 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         self._record_filter_state()
         self._schedule_filter()
 
+    def _on_any_box_focused(self):
+        """需求5：在「无选中行（五框为空）」且当前处于某分组筛选态时，
+        点/聚焦五框任意一个框 → 取消分组筛选，回到「全部」视图（表格列出全部值）。
+        编辑态（已选中行、五框有值）不触发，避免打断正在修改的值。"""
+        if self._selected_view_rows():
+            return  # 编辑态：点框是为了改值，不回全部
+        # 当前是否处于某分组筛选态（左侧高亮了非「全部」的分组）
+        cur_group = ""
+        if self._current_kind == "tsv":
+            cur_group = self._model._filter_state.get("group", "") if hasattr(self._model, "_filter_state") else ""
+        # 用左侧分组列表当前行判断更可靠
+        from PyQt5.QtWidgets import QListWidget
+        gw = getattr(self, "groupListWidget", None)
+        if gw is not None and gw.currentRow() > 0:
+            # 处于某分组筛选态 → 回到全部
+            self._clear_group_filter_to_all()
+
+    def _clear_group_filter_to_all(self):
+        """取消分组筛选，回到「全部」：等价于点左侧「（全部）」标签。"""
+        if self._model is None or self._current_kind not in ("dict", "tsv"):
+            return
+        self._clear_fields()
+        gw = getattr(self, "groupListWidget", None)
+        if gw is not None:
+            gw.setCurrentRow(0)   # 左侧高亮回「（全部）」
+        self._model.set_filter_state(group="", field={})
+        self._run_background_filter(autofill=False)
+        self._update_status()
+
     def _on_combo_changed(self):
         """下拉选择：
         - 筛选态（无选中行）：级联限制选项 + 记录筛选条件 + 防抖重筛；
-        - 编辑态（已选中行）：仅更新显示，不级联/不重筛（保存时写回选中行）。"""
+        - 编辑态（已选中行）：仅更新显示，不级联/不重筛/不联动（保存时按五框当前值写回选中行）。
+
+        注：所有列间联动已取消（用户要求）。五框里填什么，保存就写什么。
+        """
         if self._updating:
             return
         if self._selected_view_rows():
-            self._auto_group_on_enable_a()
             return  # 编辑态：改框只改显示，等保存时写回选中行
         field = self._field_for_widget(self.sender())
         self._refresh_cascading(field)
         self._record_filter_state()
         self._schedule_filter()
-
-    def _auto_group_on_enable_a(self):
-        """编辑态：当用户把「启用」改为 A 时，在五框内自动关联一个分组名，方便少选一次：
-        - 当前分组以 E 开头 → 关联为 `E Google一万`
-        - 其它            → 关联为 `B 青云`
-        仅在选中单行时生效；仅此一个联动——只是填充「分组」框、不锁定（用户仍可改选其它分组），
-        不触发任何自动保存（保存始终手动），也不反向联动其它框（词组/编码/权重/启用）。"""
-        if self.sender() is not self.comboEnable:
-            return                      # 仅响应「启用」框的改动（避免词组/编码/权重/分组改动误触发）
-        if self._updating:
-            return
-        rows = self._selected_view_rows()
-        if len(rows) != 1:
-            return                      # 仅单选行编辑态生效（多选清空五框，无单行可写回）
-        if self.comboEnable.currentText().strip() != "A":
-            return                      # 仅当启用改为 A
-        cur_group = self.comboGroup.currentText().strip()
-        target = "E Google一万" if cur_group.upper().startswith("E") else "B 青云"
-        # 仅填充「分组」框（不锁定：用户仍可改选其它分组）；不自动保存、不联动其它框
-        self._updating = True
-        try:
-            self.comboGroup.setCurrentText(target)
-        finally:
-            self._updating = False
 
     def _record_filter_state(self):
         """把当前五框值记为「筛选态」快照（用于保存后复位五框、回到最初筛选结果）。"""
@@ -1609,31 +1646,46 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
 
     def _write_back_row(self, view_row):
         """把五框当前值写回指定可见行（tsv 可写；dict 只读不走此路）。
-        写全部非空框值 → 启用+分组等多值一次写回（满足「写回所有修改过的值」）。"""
+        写全部非空框值 → 启用+分组等多值一次写回（满足「五框显示什么就保存什么」）。
+        不做任何漂移/一致性校验：只要选中了单行，五框内的五个值（非空即写，空则不动该列）
+        直接落回该行，这是唯一真相源。
+
+        ⚠️ 必须用「数据索引 di」缓存后直接改 _all_data，禁止在循环里逐个调 set_field：
+        因为改「分组」列会触发 _rebuild_order_keep_loaded() 重建 _order（行号↔数据索引映射），
+        循环中途改分组会导致后续 view_row 错位、把后续列（如启用）写到别的行
+        （即「先改分组再改启用→启用丢失」的根因）。所有列改完后统一重建一次显示顺序。
+        """
         if self._model is None or self._current_kind != "tsv":
             return
+        if not (0 <= view_row < len(self._model._order)):
+            return
+        el = self._model._order[view_row]
+        if not isinstance(el, int):
+            return
+        di = el
         fields = self._gather_fields()
         if not any(fields.values()):
             return
-        if not (0 <= view_row < self._model.rowCount()):
-            return
-        # 防御修复②：写回前校验五框「词组」与选中行当前词组一致，不一致说明
-        # 行号已漂移（如拖拽后未迁移选区、或用户已另选行），整行拒绝写回，避免把
-        # A 词条的编辑内容误写到 B 行、制造重复词条。让用户重新点选后再编辑。
-        word = fields.get("词组", "")
-        cur = self._model.get_field(view_row, "词组") if word else ""
-        if word and cur is not None and word != cur:
-            self.statusBar().showMessage(
-                "选中行已变化（五框词组与目标行不符），跳过该行写回，请重新点选后再编辑",
-                4000,
-            )
-            return
+        changed = False
         for f, col in self._model.FIELD_COLS.items():
             v = fields[f]
             if not v:
-                continue
-            if self._model.get_field(view_row, f) != v:
-                self._model.set_field(view_row, f, v)
+                continue                        # 五框该列为空 → 不动这列（保留原值）
+            if list(self._model._all_data[di])[col] != v:
+                # _all_data 的元素是「5 字段元组」(见 dict_model.__init__ 注释)，元组不可原地改，
+                # 必须先转成 list 改项再放回，否则 TypeError: 'tuple' object does not support item assignment。
+                # ← 这就是真实环境「保存失效」的根因：无头测试用 list 不触发，真实 tsv 用 tuple 必崩。
+                row = list(self._model._all_data[di])
+                row[col] = v
+                self._model._all_data[di] = row
+                changed = True
+        if changed:
+            self._model._rebuild_order_keep_loaded()
+            self._model._set_dirty(True)
+            # 关键：直接改 _all_data 绕过了 setData，不会发 dataChanged，表格视图仍显示旧值。
+            # 用「无效父索引」发 dataChanged（Qt 约定：父无效=整模型所有数据可能变化），
+            # 让下方表格整体重画并重新取数，立即反映五框保存后的新值。
+            self._model.dataChanged.emit(QModelIndex(), QModelIndex())
 
     def _write_back_rows_batch(self, view_rows):
         """多选批量写回：仅写回顶栏的「分组」「启用」两下拉字段（安全批改字段），
@@ -2058,6 +2110,109 @@ class WorkspaceWindow(QMainWindow, Ui_WorkspaceWindow):
         # 落盘后补充刷新下拉候选与按钮使能态（_persist_tsv 已清选中并重筛）
         self._refresh_combos()
         self._refresh_action_buttons()
+
+    def on_batch_delete(self):
+        """批量删除：选择『一行一词组』的文本文件，凡 TSV 第1列(词组)完全匹配的词条整行删除。
+
+        流程：弹文件选择 → 读入词组（每行 strip，空行跳过，建集合）→ 遍历显示顺序找出
+        第1列命中的行 → 二次确认（显示将删多少条）→ delete_rows_by_view 批量删 +
+        _persist_tsv 落盘（与单删 on_delete 行为一致：确认即写文件、刷新下拉/按钮）。
+        """
+        if self._model is None or self._current_kind != "tsv":
+            info(self, "批量删除", "请先加载 TSV 词库。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择待删除词组列表（每行一个词组）",
+            "", "文本文件 (*.txt);;所有文件 (*.*)")
+        if not path:
+            self.statusBar().showMessage("已取消批量删除", 2000)
+            return
+        # 读词组文件 → 集合（O(1) 查重；保留原始大小写做精确完全匹配）
+        try:
+            with open(path, encoding="utf-8") as fh:
+                targets = {ln.strip() for ln in fh if ln.strip()}
+        except Exception as exc:  # noqa: BLE001
+            critical(self, "批量删除", "读取词组文件失败：%s" % exc)
+            return
+        if not targets:
+            info(self, "批量删除", "词组文件为空，没有可删除的词。")
+            return
+        # 找出第1列(词组)完全命中的显示行号
+        hit_view_rows = []
+        order = self._model._order
+        data = self._model._all_data
+        for vr, e in enumerate(order):
+            if isinstance(e, int) and 0 <= e < len(data):
+                if data[e][0].strip() in targets:
+                    hit_view_rows.append(vr)
+        n_hit = len(hit_view_rows)
+        if n_hit == 0:
+            info(self, "批量删除",
+                 "文件中 %d 个词组，在当前词库里均未找到匹配（第1列完全匹配），无需删除。" % len(targets))
+            return
+        reply = ConfirmBox.ask(
+            self, "确认批量删除",
+            "将从词库删除 %d 行（词组与文件完全匹配）。\n文件共 %d 个词组，其中 %d 个命中。\n"
+            "确认后将从文件移除并保存。" % (n_hit, len(targets), n_hit),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        # 批量删（单次重建，避免 O(n²)）；复用 delete_rows_by_view 自动处理 dirty/rebuild/重复重算
+        deleted = self._model.delete_rows_by_view(hit_view_rows)
+        if not deleted:
+            return
+        self._invalidate_filter()
+        self._persist_tsv(f"已批量删除 {deleted} 行并保存")
+        self._refresh_combos()
+        self._refresh_action_buttons()
+
+    def on_export_group(self):
+        """导出分组（功能5）：先点选左侧分组栏标签 → 再点此钮 →
+        把该分组下右侧表格当前显示的整表内容导出为 TSV。
+
+        取数口径：直接读 _model._order（即右侧表格当前显示行，含分组头过滤后的真实顺序），
+        跳过分组头行，仅导出数据行。用户点选分组标签后右侧表格已只剩该组，故无需再按列二次筛。
+        弹原生『保存』窗口（输入名称），写 5 列 tab 制表符 TSV（与源文件同格式）。
+        """
+        if self._model is None or self._current_kind != "tsv":
+            info(self, "导出分组", "请先加载 TSV 词库。")
+            return
+        # 1) 取左侧当前选中的分组标签（用户刚点选的那个）
+        cur = self.groupListWidget.currentItem()
+        group_name = "" if cur is None or cur.text() == "（全部）" else cur.text()
+        # 2) 取右侧表格当前显示的全部数据行（保留屏幕顺序）
+        order = self._model._order
+        data = self._model._all_data
+        rows = []
+        for e in order:
+            if isinstance(e, int) and 0 <= e < len(data):
+                rows.append(data[e])
+        if not rows:
+            info(self, "导出分组",
+                 "当前右侧表格没有可导出的内容（该分组下无词条，或未加载数据）。")
+            return
+        # 3) 弹原生保存窗口（输入名称），默认文件名带分组名
+        default_name = ("%s.tsv" % group_name) if group_name else "全部分组.tsv"
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "导出分组「%s」" % (group_name or "全部"),
+            default_name, "TSV 文件 (*.tsv);;所有文件 (*.*)")
+        if not out_path:
+            self.statusBar().showMessage("已取消导出分组", 2000)
+            return
+        if not out_path.lower().endswith(".tsv"):
+            out_path += ".tsv"
+        # 4) 写 5 列 tab 制表符 TSV（与源 Alamo.tsv 同格式）
+        try:
+            with open(out_path, "w", encoding="utf-8", newline="") as fh:
+                for r in rows:
+                    fh.write("\t".join((c or "").strip() for c in r) + "\n")
+        except OSError as exc:
+            critical(self, "导出分组", "写出失败：\n%s" % exc)
+            return
+        info(self, "导出分组",
+             "已导出分组「%s」：%d 行\n→ %s" % (group_name or "全部", len(rows), out_path))
+        self.statusBar().showMessage(
+            "已导出分组 %s（%d 行）→ %s" % (group_name or "全部", len(rows), out_path), 4000)
 
     def on_deploy(self):
         """保存并触发 Rime 部署。本期部署钩子默认等价于保存；外部部署命令可在此扩展。"""
